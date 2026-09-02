@@ -178,6 +178,18 @@ select{background-image:url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.o
 .optional-tag{font-weight:400;color:var(--grey);font-size:12px;letter-spacing:0;text-transform:none}
 .turnstile-wrap{display:flex;justify-content:center;margin-top:18px;min-height:70px}
 .turnstile-note{font-family:var(--heading);font-size:12.5px;color:var(--grey);text-align:center;margin-top:8px}
+.resume-card{background:var(--white);border:1.5px solid var(--line-soft);border-radius:18px;padding:22px;margin:0 0 22px;text-align:left}
+.resume-card h4{font-family:var(--heading);font-weight:600;font-size:15.5px;margin-bottom:7px}
+.resume-card p{font-family:var(--heading);font-weight:400;font-size:14px;color:var(--grey);line-height:1.55}
+.btn-ghost{background:transparent;color:var(--grey);border:1.5px solid var(--line-soft);width:100%;font-size:15px;padding:14px 28px;margin-top:10px}
+.btn-ghost:hover{border-color:var(--line);color:var(--ink)}
+.recap{text-align:left;margin:6px 0 4px}
+.recap-item{padding:13px 0;border-bottom:1px solid var(--line-soft)}
+.recap-item:last-child{border-bottom:none}
+.recap-item .k{font-family:var(--heading);font-size:11.5px;font-weight:600;letter-spacing:.07em;text-transform:uppercase;color:var(--grey);margin-bottom:4px}
+.recap-item .v{font-family:var(--body);font-size:16px;color:var(--ink);line-height:1.5;white-space:pre-wrap}
+.link-btn{background:none;border:none;font-family:var(--heading);font-size:13px;color:var(--grey);text-decoration:underline;cursor:pointer;padding:6px;margin-top:12px}
+.link-btn:hover{color:var(--ink)}
 .fmt-info{background:#FFF6EC;border:1.5px solid #FFD9B3;border-radius:12px;padding:15px 17px;margin-bottom:18px}
 .fmt-info h4{font-family:var(--heading);font-size:13px;font-weight:600;letter-spacing:.03em;text-transform:uppercase;color:var(--brown);margin-bottom:7px}
 .fmt-info p{font-size:15.5px;line-height:1.55;margin-bottom:8px}
@@ -256,6 +268,108 @@ let flow = [];
 let stepIdx = 0;
 const history = [];
 
+/* ============ returning patients: token, saved draft, sent record ============
+   Everything here stays in the patient's own browser. Nothing they type is sent
+   anywhere until they consent and submit. The token is the only part that also
+   reaches us, and only on a successful submit, so the clinic can tell that two
+   consults came from the same browser. It is random and identifies nobody. */
+const TOKEN_KEY='ewc_token_v1', DRAFT_KEY='ewc_draft_v1', SENT_KEY='ewc_sent_v1';
+const DRAFT_TTL_DAYS=14;   // unfinished answers are discarded after two weeks
+const SENT_TTL_DAYS=60;    // the "you already sent one" notice stops after two months
+
+// Private windows, locked-down browsers and blocked cookies all throw here. The
+// form has to keep working in that case — it just can't offer to restore anything.
+function store(){ try{ const s=window.localStorage; s.getItem(TOKEN_KEY); return s; }catch(e){ return null; } }
+function readJSON(k){ const s=store(); if(!s) return null; try{ return JSON.parse(s.getItem(k)||'null'); }catch(e){ return null; } }
+function writeJSON(k,v){ const s=store(); if(!s) return; try{ s.setItem(k,JSON.stringify(v)); }catch(e){} }
+function dropKey(k){ const s=store(); if(!s) return; try{ s.removeItem(k); }catch(e){} }
+
+function newToken(){
+  try{ if(crypto&&crypto.randomUUID) return crypto.randomUUID().replace(/-/g,''); }catch(e){}
+  try{ const a=new Uint8Array(16); crypto.getRandomValues(a);
+       return Array.from(a).map(b=>b.toString(16).padStart(2,'0')).join(''); }catch(e){}
+  return (Date.now().toString(36)+Math.random().toString(36).slice(2)).slice(0,32);
+}
+const draftToken=(function(){
+  const s=store(); if(!s) return newToken();            // no storage: fresh each visit
+  let t=null; try{ t=s.getItem(TOKEN_KEY); }catch(e){}
+  if(!t||!/^[a-zA-Z0-9_-]{8,64}$/.test(t)){ t=newToken(); try{ s.setItem(TOKEN_KEY,t); }catch(e){} }
+  return t;
+})();
+
+const daysSince=ms=>(Date.now()-ms)/86400000;
+function fmtWhen(ms){
+  try{ return new Date(ms).toLocaleDateString('en-AU',{day:'numeric',month:'long',year:'numeric'}); }
+  catch(e){ return 'earlier'; }
+}
+
+function loadDraft(){
+  const d=readJSON(DRAFT_KEY);
+  if(!d||!d.savedAt||!d.answers) return null;
+  if(daysSince(d.savedAt)>DRAFT_TTL_DAYS){ dropKey(DRAFT_KEY); return null; }
+  return d;
+}
+let draftTimer=null;
+function scheduleDraftSave(){ clearTimeout(draftTimer); draftTimer=setTimeout(saveDraft,400); }
+function saveDraft(){
+  if(sentRecord) return;
+  const id=flow[stepIdx];
+  if(id==='loading'||id==='done'||id==='already_sent') return;
+  if(!Object.keys(answers).length) return;              // nothing typed yet
+  writeJSON(DRAFT_KEY,{savedAt:Date.now(),stepIdx,history:history.slice(),answers});
+}
+function clearDraft(){ clearTimeout(draftTimer); dropKey(DRAFT_KEY); }
+
+function loadSent(){
+  const r=readJSON(SENT_KEY);
+  if(!r||!r.sentAt) return null;
+  if(daysSince(r.sentAt)>SENT_TTL_DAYS){ dropKey(SENT_KEY); return null; }
+  return r;
+}
+let sentRecord=loadSent();
+let pendingResume=null;
+
+function wipeAnswers(){ Object.keys(answers).forEach(k=>delete answers[k]); history.length=0; }
+
+function resumeDraft(){
+  if(!pendingResume) return;
+  Object.assign(answers,pendingResume.answers||{});
+  history.length=0; (pendingResume.history||[]).forEach(h=>history.push(h));
+  // Never resume straight into 'loading' — that would fire a submit on arrival.
+  const cap=flow.indexOf('details');
+  stepIdx=Math.min(typeof pendingResume.stepIdx==='number'?pendingResume.stepIdx:0,cap);
+  pendingResume=null; render();
+}
+function startFresh(){ pendingResume=null; clearDraft(); wipeAnswers(); stepIdx=0; render(); }
+function startNewConsult(){
+  dropKey(SENT_KEY); sentRecord=null; clearDraft(); wipeAnswers(); stepIdx=0; render();
+}
+function forgetMyAnswers(){
+  clearDraft(); dropKey(SENT_KEY); sentRecord=null; pendingResume=null;
+  wipeAnswers(); stepIdx=0; render();
+}
+
+const RECAP_FIELDS=[
+  ['Your doctor','doctor'],['Before treatment','feeling_before'],['How you feel today','feeling_today'],
+  ['Positive changes','positive_changes'],['Negative changes','negative_changes'],
+  ['Following the plan','adherence'],['More on that','adherence_detail'],
+  ['Question 1','q1'],['Question 2','q2'],['Question 3','q3'],['Question 4','q4'],['Question 5','q5'],
+  ['Anything else','anything_else']
+];
+const VALUE_LABELS={
+  paul_froomes:'Dr Paul Froomes', juliet_froomes:'Dr Juliet Froomes', lisa_laidlaw:'Dr Lisa Laidlaw',
+  vidya_prabhu:'Dr Vidya Prabhu', joanna_hickey:'Dr Joanna Hickey', grant_burns:'Dr Grant Burns',
+  followed_closely:"I've followed it closely", most_with_gaps:"I've followed most of it, with some gaps",
+  some_parts:"I've followed parts of it", struggled:"I've struggled to follow it", other:'Other'
+};
+function recapHTML(a){
+  const rows=RECAP_FIELDS.map(([label,key])=>{
+    const raw=a[key]; if(!raw||!String(raw).trim()) return '';
+    return `<div class="recap-item"><div class="k">${label}</div><div class="v">${esc(VALUE_LABELS[raw]||String(raw))}</div></div>`;
+  }).join('');
+  return rows?`<div class="recap">${rows}</div>`:'<p class="mini-note">Your answers are no longer stored on this device.</p>';
+}
+
 const facts = [
   "Your doctor personally reads every answer you give here before writing their response.",
   "The clearer and more specific your questions, the more targeted your doctor's recommendations can be.",
@@ -277,7 +391,13 @@ welcome:{
       <div class="logo-big">${logoSVG}</div>
       <h1>Your Express<br>Written Consult</h1>
       <p class="sub">A few questions so your doctor can give you a considered, personalised written response — with recommendations, within 3 business days. Takes about 15–20 minutes.</p>
-      <button class="btn btn-cta" onclick="next()">Begin</button>
+      ${pendingResume?`<div class="resume-card">
+        <h4>Welcome back</h4>
+        <p>You started this form on ${fmtWhen(pendingResume.savedAt)} and didn't finish it. Your answers were saved on this device only — nothing has been sent to the clinic yet.</p>
+      </div>
+      <button class="btn btn-cta" onclick="resumeDraft()">Continue where I left off</button>
+      <button class="btn btn-ghost" onclick="startFresh()">Start again from the beginning</button>`
+      :`<button class="btn btn-cta" onclick="next()">Begin</button>`}
       <div class="trust">
         <svg viewBox="0 0 24 24" fill="none" stroke="#8B887A" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
         Private &amp; confidential — read only by your care team
@@ -430,7 +550,8 @@ consent:{
        <span class="box"></span><span class="txt">I consent to the collection and use of my information as described above, and confirm my answers are accurate to the best of my knowledge.</span>
      </div></div>
      <div class="turnstile-wrap"><div id="turnstileBox"></div></div>
-     <p class="turnstile-note">A quick automated check that you're a real person.</p>`,
+     <p class="turnstile-note">A quick automated check that you're a real person.</p>
+     <p class="hint" id="gateHint" style="margin-top:10px"></p>`,
   onRender:()=>mountTurnstile(),
   valid:()=>answers.consent===true && !!turnstileToken
 },
@@ -477,10 +598,29 @@ done:{
       <p class="mini-note">Need to change something, or have a question? Call us on 03 9007 2630.</p>
     </div>`
 },
+
+/* Shown instead of the welcome screen when this browser has already sent one. */
+already_sent:{
+  nav:false, progress:false, showIf:()=>false,
+  render:()=>`
+    <div class="done" style="padding-top:4vh">
+      <div class="bigtick"><svg viewBox="0 0 24 24"><path d="M20 6 9 17l-5-5"/></svg></div>
+      <h1>You've already sent one</h1>
+      <p class="sub">You submitted an Express Written Consult on ${fmtWhen(sentRecord.sentAt)}${sentRecord.shortId?` (reference ${esc(sentRecord.shortId)})`:''}. Your doctor has it and will respond within 3 business days of that date.</p>
+      <div class="done-card">
+        <h3>What you told your doctor</h3>
+        ${recapHTML(sentRecord.answers||{})}
+      </div>
+      <p class="mini-note">If your consult has already been answered and you need another one, you can start a fresh consult. A separate consult fee applies. Your previous answers will stop being shown here, but your doctor keeps them on your file.</p>
+      <button class="btn btn-ghost" onclick="startNewConsult()">Start a new consult</button>
+      <button class="link-btn" onclick="forgetMyAnswers()">Not your device? Remove these answers</button>
+      <p class="mini-note">Questions about the consult you've already sent? Call us on 03 9007 2630.</p>
+    </div>`
+},
 };
 
 /* ============ flow ============ */
-flow = ['welcome','e_emergency','e_doctor','e_payment','e_before','e_today','e_positive','e_negative','e_adherence','e_adherence_detail','transition','e_questions','e_extras','acknowledge','consent','details','loading','done'];
+flow = ['welcome','e_emergency','e_doctor','e_payment','e_before','e_today','e_positive','e_negative','e_adherence','e_adherence_detail','transition','e_questions','e_extras','acknowledge','consent','details','loading','done','already_sent'];
 
 /* ============ helpers ============ */
 function esc(v){return (v||"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/"/g,"&quot;")}
@@ -575,6 +715,7 @@ function buildPayload(){
     consent_version: 'v1',
     disclaimer_version: 'v1',
     turnstile_token: turnstileToken,
+    draft_token: draftToken,
     website: ''
   };
 }
@@ -593,6 +734,10 @@ async function submitForm(){
     if(!res.ok || !data.ok) throw new Error(data.error || ('HTTP '+res.status));
     submitState.result = data;
     submitState.done = true;
+    // Keep a local record so a return visit shows what was sent, and clear the draft.
+    sentRecord = { sentAt: Date.now(), shortId: data.short_id || null, answers: JSON.parse(JSON.stringify(answers)) };
+    writeJSON(SENT_KEY, sentRecord);
+    clearDraft();
   }catch(err){
     console.error('submit failed', err);
     submitState.error = err.message || 'Network error';
@@ -652,6 +797,16 @@ function check(){
   const st=currentStep();
   if(st.valid) btnNext.disabled=!st.valid();
   else btnNext.disabled=false;
+  // Say why Continue is greyed out, so nobody is left staring at a dead button.
+  const gh=document.getElementById('gateHint');
+  if(gh){
+    const needConsent=answers.consent!==true, needBot=!turnstileToken;
+    gh.textContent = (!needConsent&&!needBot) ? ''
+      : (needConsent&&needBot) ? 'Tick the consent box above, then complete the "Verify you are human" check.'
+      : needConsent ? 'Tick the consent box above to continue.'
+      : 'Complete the "Verify you are human" check above to continue.';
+  }
+  scheduleDraftSave();
 }
 function next(){
   const el=stage.querySelector('.step');
@@ -668,7 +823,16 @@ btnBack.addEventListener('click',()=>{
   stepIdx=history.pop();
   render();
 });
-render();
+
+// Save whatever is typed if the tab is closed or backgrounded mid-answer.
+window.addEventListener('pagehide',saveDraft);
+document.addEventListener('visibilitychange',()=>{ if(document.visibilityState==='hidden') saveDraft(); });
+
+(function boot(){
+  if(sentRecord){ stepIdx=flow.indexOf('already_sent'); render(); return; }
+  pendingResume=loadDraft();
+  render();
+})();
 </script>
 </body>
 </html>
