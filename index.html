@@ -539,7 +539,6 @@ function mountTurnstile(){
 
 /* ============ submission ============ */
 const ENDPOINT = "https://hysojqfikvhcupczsqtx.supabase.co/functions/v1/submit-express-written-consult";
-const ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imh5c29qcWZpa3ZoY3VwY3pzcXR4Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODU4ODkwMTMsImV4cCI6MjEwMTQ2NTAxM30.u4OzRr2Ap1U5PbXZL5WEWwXyLovf8xoSKGUZbOz0d9o";
 let submitState = { sending:false, done:false, error:null, result:null };
 
 function buildPayload(){
@@ -587,7 +586,7 @@ async function submitForm(){
   try{
     const res = await fetch(ENDPOINT, {
       method:'POST',
-      headers:{'Content-Type':'application/json','apikey':ANON_KEY},
+      headers:{'Content-Type':'application/json'},
       body: JSON.stringify(buildPayload())
     });
     const data = await res.json().catch(()=>({}));
